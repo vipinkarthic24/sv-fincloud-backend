@@ -22,6 +22,23 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+def _get_dsn() -> str:
+    """Return a psycopg2-compatible DSN, preferring DATABASE_URL."""
+    db_url = os.getenv("DATABASE_URL")
+    if db_url:
+        if db_url.startswith("postgresql://"):
+            db_url = db_url.replace("postgresql://", "postgres://", 1)
+        return db_url
+    return (
+        f"host={os.getenv('DB_HOST')} "
+        f"port={os.getenv('DB_PORT', '6543')} "
+        f"dbname={os.getenv('DB_NAME', 'postgres')} "
+        f"user={os.getenv('DB_USER')} "
+        f"password={os.getenv('DB_PASSWORD')} "
+        f"sslmode=require"
+    )
+
+
 # Lazy-initialized connection pool
 _service_pool = None
 
@@ -31,12 +48,7 @@ def init_service_pool():
     if _service_pool is None:
         _service_pool = SimpleConnectionPool(
             1, 5,
-            host=os.getenv("DB_HOST"),
-            port=int(os.getenv("DB_PORT", 6543)),
-            database=os.getenv("DB_NAME", "postgres"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            sslmode="require",
+            dsn=_get_dsn(),
             cursor_factory=RealDictCursor,
         )
         logger.info("Gold rate service pool initialized")

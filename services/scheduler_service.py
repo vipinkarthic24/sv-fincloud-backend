@@ -19,16 +19,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def get_pg_connection():
-    return psycopg2.connect(
-        host=os.getenv("DB_HOST", "aws-1-ap-southeast-1.pooler.supabase.com"),
-        database=os.getenv("DB_NAME", "postgres"),
-        user=os.getenv("DB_USER", "postgres.roibmmoznlgtontiinns"),
-        password=os.getenv("DB_PASSWORD"),
-        port=int(os.getenv("DB_PORT", 6543)),
-        sslmode="require",
-        cursor_factory=RealDictCursor,
+def _get_dsn() -> str:
+    """Return a psycopg2-compatible DSN, preferring DATABASE_URL."""
+    db_url = os.getenv("DATABASE_URL")
+    if db_url:
+        if db_url.startswith("postgresql://"):
+            db_url = db_url.replace("postgresql://", "postgres://", 1)
+        return db_url
+    # Local / dev fallback
+    return (
+        f"host={os.getenv('DB_HOST')} "
+        f"port={os.getenv('DB_PORT', '6543')} "
+        f"dbname={os.getenv('DB_NAME', 'postgres')} "
+        f"user={os.getenv('DB_USER')} "
+        f"password={os.getenv('DB_PASSWORD')} "
+        f"sslmode=require"
     )
+
+
+def get_pg_connection():
+    conn = psycopg2.connect(_get_dsn(), cursor_factory=RealDictCursor)
+    return conn
 from datetime import datetime, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
 from services.lending_engine_service import daily_repo_rate_job
