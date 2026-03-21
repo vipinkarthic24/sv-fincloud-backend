@@ -2311,20 +2311,20 @@ async def apply_for_loan(
             if request.vehicle_age is None:
                 raise HTTPException(status_code=400, detail="Vehicle age required")
 
-            # Vehicle collateral locking — prevent same vehicle in multiple active loans
+            # Vehicle collateral locking — global check across all tenants
             if request.vehicle_reg_no:
+                _vno = request.vehicle_reg_no.strip().upper().replace(" ", "")
                 cursor.execute("""
                     SELECT id FROM loans
-                    WHERE vehicle_reg_no = %s
-                    AND status IN ('pending','pre-approved','active')
-                    AND tenant_id = %s
+                    WHERE UPPER(REPLACE(COALESCE(vehicle_reg_no, ''), ' ', '')) = %s
+                      AND status IN ('pending', 'pre-approved', 'active', 'approved', 'disbursed')
                     """,
-                    (request.vehicle_reg_no, tenant_id)
+                    (_vno,)
                 )
                 if cursor.fetchone():
                     raise HTTPException(
                         status_code=400,
-                        detail="This vehicle already has an active or pending loan."
+                        detail="This vehicle already has an active loan in the system. The previous loan must be closed before applying for a new one."
                     )
 
             # Vehicle owner must match applicant
@@ -2419,23 +2419,22 @@ async def apply_for_loan(
         # Update customer's monthly income
         cursor.execute("""UPDATE customers SET monthly_income = %s WHERE id = %s""", (request.monthly_income, customer["id"]))
         # ═══════════════════════════════════════
-        # VEHICLE COLLATERAL LOCK CHECK
+        # VEHICLE COLLATERAL LOCK CHECK (global)
         # ═══════════════════════════════════════
         if request.loan_type == "vehicle_loan" and request.vehicle_reg_no:
-
+            _vno2 = request.vehicle_reg_no.strip().upper().replace(" ", "")
             cursor.execute("""
                 SELECT id FROM loans
-                WHERE vehicle_reg_no = %s
-                AND status IN ('pending','pre-approved','active')
-                AND tenant_id = %s
-            """, (request.vehicle_reg_no, tenant_id))
+                WHERE UPPER(REPLACE(COALESCE(vehicle_reg_no, ''), ' ', '')) = %s
+                  AND status IN ('pending', 'pre-approved', 'active', 'approved', 'disbursed')
+            """, (_vno2,))
 
             existing_loan = cursor.fetchone()
 
             if existing_loan:
                 raise HTTPException(
                     status_code=400,
-                    detail="This vehicle already has an active or pending loan."
+                    detail="This vehicle already has an active loan in the system. The previous loan must be closed before applying for a new one."
                 )
         # 7️⃣ Insert loan
         loan_id = str(uuid.uuid4())
