@@ -110,21 +110,48 @@ db_pool = None
 def init_db_pool():
     global db_pool
     if db_pool is None:
-        db_pool = SimpleConnectionPool(
-            1, 10,
-            host=os.getenv("DB_HOST"),
-            port=int(os.getenv("DB_PORT", 6543)),
-            database=os.getenv("DB_NAME", "postgres"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            sslmode="require",
-            connect_timeout=10,
-            keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=5,
-        )
-        logger.info("Connection pool initialized")
+        database_url = os.getenv("DATABASE_URL")
+        if database_url:
+            # Railway / Supabase supply a full connection URL.
+            # psycopg2 requires the postgres:// scheme (not postgresql://).
+            if database_url.startswith("postgresql://"):
+                database_url = database_url.replace("postgresql://", "postgres://", 1)
+            # Parse the URL into explicit components so psycopg2 never falls
+            # back to a local Unix socket.
+            from urllib.parse import urlparse
+            parsed = urlparse(database_url)
+            db_pool = SimpleConnectionPool(
+                1, 10,
+                host=parsed.hostname,
+                port=parsed.port or 6543,
+                database=parsed.path.lstrip("/"),
+                user=parsed.username,
+                password=parsed.password,
+                sslmode="require",
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5,
+            )
+            logger.info("Connection pool initialized from DATABASE_URL (host=%s)", parsed.hostname)
+        else:
+            # Local / dev fallback — individual env vars
+            db_pool = SimpleConnectionPool(
+                1, 10,
+                host=os.getenv("DB_HOST"),
+                port=int(os.getenv("DB_PORT", 6543)),
+                database=os.getenv("DB_NAME", "postgres"),
+                user=os.getenv("DB_USER"),
+                password=os.getenv("DB_PASSWORD"),
+                sslmode="require",
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5,
+            )
+            logger.info("Connection pool initialized from individual env vars (host=%s)", os.getenv("DB_HOST"))
 
 
 # Database connection helper — ensures pool exists before use
