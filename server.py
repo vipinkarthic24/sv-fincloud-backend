@@ -627,6 +627,19 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_repo_rate_tenant ON repo_rate_history(tenant_id, fetched_at DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_customers_tenant ON customers(tenant_id, branch_id)")
 
+        # Partial unique index: prevent duplicate active vehicle loans across the entire system
+        try:
+            cursor.execute("SAVEPOINT sp_vehicle_idx")
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS unique_active_vehicle_loan
+                ON loans (UPPER(REPLACE(COALESCE(vehicle_reg_no, ''), ' ', '')))
+                WHERE status IN ('active', 'approved', 'disbursed')
+            """)
+            cursor.execute("RELEASE SAVEPOINT sp_vehicle_idx")
+        except Exception as e:
+            cursor.execute("ROLLBACK TO SAVEPOINT sp_vehicle_idx")
+            logger.warning("unique_active_vehicle_loan index skipped: %s", e)
+
         # Repo Rate History table (for dynamic lending engine)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS repo_rate_history (
@@ -3590,6 +3603,19 @@ async def approve_loan(data: dict, token_data: dict = Depends(require_role(['fin
                 if stored and vehicle_reg_no != stored:
                     raise HTTPException(400,
                         f"Vehicle number mismatch: entered '{vehicle_reg_no}', expected '{stored}'")
+
+                # Global duplicate check — block if this vehicle already has an active loan anywhere
+                cursor.execute("""
+                    SELECT id FROM loans
+                    WHERE UPPER(REPLACE(COALESCE(vehicle_reg_no, ''), ' ', '')) = %s
+                      AND status IN ('active', 'approved', 'disbursed')
+                      AND id != %s
+                """, (vehicle_reg_no.replace(' ', ''), loan_id))
+                if cursor.fetchone():
+                    raise HTTPException(400,
+                        "This vehicle already has an active loan in the system. "
+                        "The previous loan must be closed before a new one can be approved."
+                    )
 
             elif loan_type == "personal_loan":
                 if input_cibil is None or input_cibil == "":
