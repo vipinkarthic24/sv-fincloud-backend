@@ -2326,7 +2326,7 @@ async def apply_for_loan(
                 if cursor.fetchone():
                     raise HTTPException(
                         status_code=400,
-                        detail="This vehicle already has an active loan in the system. The previous loan must be closed before applying for a new one."
+                        detail="This vehicle is already associated with an active or pending loan in the FinCloud network."
                     )
 
             # Vehicle owner must match applicant
@@ -3834,8 +3834,7 @@ async def approve_loan(data: dict, token_data: dict = Depends(require_role(['fin
                 """, (vehicle_reg_no.replace(' ', ''), loan_id))
                 if cursor.fetchone():
                     raise HTTPException(400,
-                        "This vehicle already has an active loan in the system. "
-                        "The previous loan must be closed before a new one can be approved."
+                        "This vehicle is already associated with an active or pending loan in the FinCloud network."
                     )
 
             elif loan_type == "personal_loan":
