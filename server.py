@@ -8108,6 +8108,9 @@ async def set_gold_rate_mode(
 
         conn.commit()
 
+        # Invalidate gold rate cache so next fetch reflects the new mode
+        _cache_invalidate_prefix(f"gold_rate:{tenant_id}")
+
         # 🆕 When switching to auto, immediately fetch and insert the latest market rate
         if mode == "auto":
             try:
