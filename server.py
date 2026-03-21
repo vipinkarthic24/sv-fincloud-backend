@@ -2454,18 +2454,34 @@ async def apply_for_loan(
         # 7️⃣ Insert loan
         loan_id = str(uuid.uuid4())
 
-        # Generate loan_number (GL-N / PL-N / VL-N) — global per tenant
+        # Generate loan_number (GL-N / PL-N / VL-N) — gap-filling: lowest unused N per tenant
         prefix_map = {'gold_loan': 'GL', 'personal_loan': 'PL', 'vehicle_loan': 'VL'}
         ln_prefix = prefix_map.get(request.loan_type, 'LN')
         cursor.execute("""
-            INSERT INTO loan_sequences (tenant_id, loan_type, current_value)
-            VALUES (%s, %s, 1)
-            ON CONFLICT (tenant_id, loan_type)
-            DO UPDATE SET current_value = loan_sequences.current_value + 1
-            RETURNING current_value
-        """, (tenant_id, request.loan_type))
-        ln_row = cursor.fetchone()
-        loan_number = f"{ln_prefix}-{ln_row['current_value']}" if ln_row else None
+            SELECT COALESCE(
+                (
+                    -- Find the lowest positive integer not already used
+                    SELECT s.n
+                    FROM generate_series(1, (
+                        SELECT COUNT(*) + 1
+                        FROM loans
+                        WHERE loan_type = %s AND tenant_id = %s
+                          AND loan_number ~ ('^' || %s || '-[0-9]+$')
+                    )) AS s(n)
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM loans
+                        WHERE loan_type = %s AND tenant_id = %s
+                          AND loan_number = %s || '-' || s.n
+                    )
+                    ORDER BY s.n
+                    LIMIT 1
+                ),
+                1
+            ) AS next_n
+        """, (request.loan_type, tenant_id, ln_prefix,
+              request.loan_type, tenant_id, ln_prefix))
+        next_n = cursor.fetchone()['next_n']
+        loan_number = f"{ln_prefix}-{next_n}"
 
         cursor.execute("""
             INSERT INTO loans (
@@ -7988,18 +8004,22 @@ async def download_avg_loan_report(
 
 @api_router.post("/admin/resync-sequences")
 async def resync_sequences(token_data: dict = Depends(require_role(['super_admin']))):
-    """One-shot endpoint to renumber all loans globally per tenant and resync sequences."""
+    """Re-index all loans per tenant in created_at order, filling gaps. Active first, then pending."""
     tenant_id = token_data["tenant_id"]
     with get_db() as conn:
         cursor = conn.cursor()
         prefix_map = {'gold_loan': 'GL', 'personal_loan': 'PL', 'vehicle_loan': 'VL'}
         updated = {}
         for lt, prefix in prefix_map.items():
-            # Renumber all loans of this type for this tenant in created_at order
+            # Renumber: active/approved/disbursed/closed first, then pending/pre-approved — all in created_at order
             cursor.execute("""
                 WITH ranked AS (
                     SELECT id,
-                           ROW_NUMBER() OVER (ORDER BY created_at ASC) AS rn
+                           ROW_NUMBER() OVER (
+                               ORDER BY
+                                 CASE WHEN status IN ('active','approved','disbursed','closed') THEN 0 ELSE 1 END,
+                                 created_at ASC
+                           ) AS rn
                     FROM loans
                     WHERE loan_type = %s AND tenant_id = %s
                 )
@@ -8010,7 +8030,7 @@ async def resync_sequences(token_data: dict = Depends(require_role(['super_admin
                 RETURNING l.loan_number
             """, (lt, tenant_id, prefix))
             rows = cursor.fetchall()
-            # Sync sequence to max
+            # Sync sequence to max so next gap-fill starts correctly
             cursor.execute("""
                 INSERT INTO loan_sequences (tenant_id, loan_type, current_value)
                 VALUES (%s, %s, %s)
