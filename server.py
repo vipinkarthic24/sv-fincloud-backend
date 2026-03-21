@@ -110,31 +110,15 @@ db_pool = None
 def init_db_pool():
     global db_pool
     if db_pool is None:
-        database_url = os.getenv("DATABASE_URL")
-        if database_url:
-            # Railway / Supabase supply a full connection URL.
-            # psycopg2 requires the postgres:// scheme (not postgresql://).
-            if database_url.startswith("postgresql://"):
-                database_url = database_url.replace("postgresql://", "postgres://", 1)
-            # Parse the URL into explicit components so psycopg2 never falls
-            # back to a local Unix socket.
-            from urllib.parse import urlparse
-            parsed = urlparse(database_url)
-            db_pool = SimpleConnectionPool(
-                1, 10,
-                host=parsed.hostname,
-                port=parsed.port or 6543,
-                database=parsed.path.lstrip("/"),
-                user=parsed.username,
-                password=parsed.password,
-                sslmode="require",
-                connect_timeout=10,
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=5,
-            )
-            logger.info("Connection pool initialized from DATABASE_URL (host=%s)", parsed.hostname)
+        db_url = os.getenv("DATABASE_URL")
+        if db_url:
+            # psycopg2 requires postgres:// not postgresql://
+            if db_url.startswith("postgresql://"):
+                db_url = db_url.replace("postgresql://", "postgres://", 1)
+            # Pass the DSN string directly — avoids any URL-parsing issues
+            # with special characters (e.g. # in passwords)
+            db_pool = SimpleConnectionPool(minconn=1, maxconn=10, dsn=db_url)
+            logger.info("Connection pool initialized from DATABASE_URL")
         else:
             # Local / dev fallback — individual env vars
             db_pool = SimpleConnectionPool(
