@@ -10171,7 +10171,7 @@ if not _FRONTEND_BUILD.is_dir():
     _FRONTEND_BUILD = ROOT_DIR.parent / "frontend" / "build"
 
 if _FRONTEND_BUILD.is_dir():
-    # Only mount /static if the static sub-folder actually exists
+    # Mount /static sub-folder (JS/CSS chunks)
     _static_dir = _FRONTEND_BUILD / "static"
     if _static_dir.is_dir():
         app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
@@ -10182,6 +10182,9 @@ if _FRONTEND_BUILD.is_dir():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_react(full_path: str):
-        """Catch-all: return index.html so React Router handles client-side routing."""
+        """Serve static files from build root if they exist, else fall back to index.html."""
+        candidate = _FRONTEND_BUILD / full_path
+        if candidate.is_file():
+            return FileResponse(str(candidate))
         return FileResponse(str(_FRONTEND_BUILD / "index.html"))
 
