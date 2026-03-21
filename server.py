@@ -1,5 +1,7 @@
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 from dateutil.relativedelta import relativedelta
 from starlette.middleware.cors import CORSMiddleware
@@ -10081,3 +10083,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Serve React frontend ──────────────────────────────────────────────────────
+# In the Docker container, frontend/build is copied into /app/frontend/build
+# ROOT_DIR is /app (backend source root), so we check both locations
+_FRONTEND_BUILD = ROOT_DIR / "frontend" / "build"
+if not _FRONTEND_BUILD.is_dir():
+    _FRONTEND_BUILD = ROOT_DIR.parent / "frontend" / "build"
+
+if _FRONTEND_BUILD.is_dir():
+    # Serve static assets (JS, CSS, images, etc.)
+    app.mount("/static", StaticFiles(directory=str(_FRONTEND_BUILD / "static")), name="static")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_react(full_path: str):
+        """Catch-all: return index.html so React Router handles client-side routing."""
+        index = _FRONTEND_BUILD / "index.html"
+        return FileResponse(str(index))
+
+    @app.get("/", include_in_schema=False)
+    async def serve_root():
+        return FileResponse(str(_FRONTEND_BUILD / "index.html"))
