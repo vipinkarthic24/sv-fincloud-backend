@@ -674,37 +674,126 @@ def init_db():
         # create_sample_data(conn)
 
         # ── Loan / Payment / Receipt number sequences ────────────────────────
+        # loan_sequences: per-tenant, per-loan-type
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS loan_sequences (
-                loan_type TEXT PRIMARY KEY,
-                current_value INT DEFAULT 0
+                tenant_id TEXT NOT NULL,
+                loan_type TEXT NOT NULL,
+                current_value INT DEFAULT 0,
+                PRIMARY KEY (tenant_id, loan_type)
             )
         """)
-        cursor.execute("""
-            INSERT INTO loan_sequences (loan_type, current_value) VALUES
-                ('gold_loan', 0), ('personal_loan', 0), ('vehicle_loan', 0)
-            ON CONFLICT (loan_type) DO NOTHING
-        """)
+        # Migrate old schema (loan_type-only PK) to new (tenant_id, loan_type) PK
+        try:
+            cursor.execute("SAVEPOINT sp_ls_migrate")
+            cursor.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'loan_sequences' AND column_name = 'tenant_id'
+            """)
+            if not cursor.fetchone():
+                # Old schema — read existing values, drop, recreate, re-seed
+                cursor.execute("SELECT loan_type, current_value FROM loan_sequences")
+                old_rows = cursor.fetchall()
+                cursor.execute("DROP TABLE loan_sequences")
+                cursor.execute("""
+                    CREATE TABLE loan_sequences (
+                        tenant_id TEXT NOT NULL,
+                        loan_type TEXT NOT NULL,
+                        current_value INT DEFAULT 0,
+                        PRIMARY KEY (tenant_id, loan_type)
+                    )
+                """)
+                # Seed each existing tenant with the old global values
+                cursor.execute("SELECT id FROM tenants")
+                tenant_ids = [r["id"] for r in cursor.fetchall()]
+                for tid in tenant_ids:
+                    for row in old_rows:
+                        cursor.execute("""
+                            INSERT INTO loan_sequences (tenant_id, loan_type, current_value)
+                            VALUES (%s, %s, %s) ON CONFLICT DO NOTHING
+                        """, (tid, row["loan_type"], row["current_value"]))
+                conn.commit()
+                logger.info("✓ Migrated loan_sequences to per-tenant schema")
+            cursor.execute("RELEASE SAVEPOINT sp_ls_migrate")
+        except Exception as e:
+            cursor.execute("ROLLBACK TO SAVEPOINT sp_ls_migrate")
+            logger.warning("loan_sequences migration skipped: %s", e)
+
+        # payment_sequence: per-tenant
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS payment_sequence (
-                id INT PRIMARY KEY DEFAULT 1,
+                tenant_id TEXT PRIMARY KEY,
                 current_value INT DEFAULT 0
             )
         """)
-        cursor.execute("""
-            INSERT INTO payment_sequence (id, current_value) VALUES (1, 0)
-            ON CONFLICT (id) DO NOTHING
-        """)
+        # Migrate old schema (id INT PK) to new (tenant_id TEXT PK)
+        try:
+            cursor.execute("SAVEPOINT sp_ps_migrate")
+            cursor.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'payment_sequence' AND column_name = 'tenant_id'
+            """)
+            if not cursor.fetchone():
+                cursor.execute("SELECT current_value FROM payment_sequence WHERE id = 1")
+                old_val = cursor.fetchone()
+                old_current = old_val["current_value"] if old_val else 0
+                cursor.execute("DROP TABLE payment_sequence")
+                cursor.execute("""
+                    CREATE TABLE payment_sequence (
+                        tenant_id TEXT PRIMARY KEY,
+                        current_value INT DEFAULT 0
+                    )
+                """)
+                cursor.execute("SELECT id FROM tenants")
+                for t in cursor.fetchall():
+                    cursor.execute("""
+                        INSERT INTO payment_sequence (tenant_id, current_value)
+                        VALUES (%s, %s) ON CONFLICT DO NOTHING
+                    """, (t["id"], old_current))
+                conn.commit()
+                logger.info("✓ Migrated payment_sequence to per-tenant schema")
+            cursor.execute("RELEASE SAVEPOINT sp_ps_migrate")
+        except Exception as e:
+            cursor.execute("ROLLBACK TO SAVEPOINT sp_ps_migrate")
+            logger.warning("payment_sequence migration skipped: %s", e)
+
+        # receipt_sequence: per-tenant
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS receipt_sequence (
-                id INT PRIMARY KEY DEFAULT 1,
+                tenant_id TEXT PRIMARY KEY,
                 current_value INT DEFAULT 0
             )
         """)
-        cursor.execute("""
-            INSERT INTO receipt_sequence (id, current_value) VALUES (1, 0)
-            ON CONFLICT (id) DO NOTHING
-        """)
+        # Migrate old schema (id INT PK) to new (tenant_id TEXT PK)
+        try:
+            cursor.execute("SAVEPOINT sp_rs_migrate")
+            cursor.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'receipt_sequence' AND column_name = 'tenant_id'
+            """)
+            if not cursor.fetchone():
+                cursor.execute("SELECT current_value FROM receipt_sequence WHERE id = 1")
+                old_val = cursor.fetchone()
+                old_current = old_val["current_value"] if old_val else 0
+                cursor.execute("DROP TABLE receipt_sequence")
+                cursor.execute("""
+                    CREATE TABLE receipt_sequence (
+                        tenant_id TEXT PRIMARY KEY,
+                        current_value INT DEFAULT 0
+                    )
+                """)
+                cursor.execute("SELECT id FROM tenants")
+                for t in cursor.fetchall():
+                    cursor.execute("""
+                        INSERT INTO receipt_sequence (tenant_id, current_value)
+                        VALUES (%s, %s) ON CONFLICT DO NOTHING
+                    """, (t["id"], old_current))
+                conn.commit()
+                logger.info("✓ Migrated receipt_sequence to per-tenant schema")
+            cursor.execute("RELEASE SAVEPOINT sp_rs_migrate")
+        except Exception as e:
+            cursor.execute("ROLLBACK TO SAVEPOINT sp_rs_migrate")
+            logger.warning("receipt_sequence migration skipped: %s", e)
         _alter_if_exists(cursor, "loans", "loan_number TEXT")
         _alter_if_exists(cursor, "payments", "payment_number TEXT")
         _alter_if_exists(cursor, "payments", "receipt_number TEXT")
@@ -729,13 +818,130 @@ def init_db():
             for lt, prefix in [('gold_loan', 'GL'), ('personal_loan', 'PL'), ('vehicle_loan', 'VL')]:
                 cursor.execute("""
                     WITH missing AS (
-                        SELECT id, ROW_NUMBER() OVER (ORDER BY created_at) AS rn
+                        SELECT id, tenant_id, ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY created_at) AS rn
                         FROM loans
                         WHERE loan_type = %s AND loan_number IS NULL
                     ),
                     max_seq AS (
-                        SELECT COALESCE(MAX(
+                        SELECT tenant_id, COALESCE(MAX(
                             CASE WHEN loan_number ~ ('^' || %s || '-[0-9]+$')
+                                 THEN CAST(SPLIT_PART(loan_number, '-', 2) AS INT)
+                                 ELSE 0 END
+                        ), 0) AS val FROM loans WHERE loan_type = %s GROUP BY tenant_id
+                    )
+                    UPDATE loans l
+                    SET loan_number = %s || '-' || (max_seq.val + missing.rn)
+                    FROM missing
+                    JOIN max_seq ON max_seq.tenant_id = missing.tenant_id
+                    WHERE l.id = missing.id
+                """, (lt, prefix, lt, prefix))
+            # Sync loan_sequences to max existing values per tenant
+            for lt in ['gold_loan', 'personal_loan', 'vehicle_loan']:
+                cursor.execute("""
+                    INSERT INTO loan_sequences (tenant_id, loan_type, current_value)
+                    SELECT tenant_id, %s,
+                        COALESCE(MAX(
+                            CASE WHEN loan_number ~ '^[A-Z]+-[0-9]+$'
+                                 THEN CAST(SPLIT_PART(loan_number, '-', 2) AS INT)
+                                 ELSE 0 END
+                        ), 0)
+                    FROM loans
+                    WHERE loan_type = %s AND loan_number IS NOT NULL
+                    GROUP BY tenant_id
+                    ON CONFLICT (tenant_id, loan_type)
+                    DO UPDATE SET current_value = GREATEST(
+                        loan_sequences.current_value, excluded.current_value
+                    )
+                """, (lt, lt))
+            cursor.execute("RELEASE SAVEPOINT sp_loan_backfill")
+            logger.debug("Loan number backfill complete")
+        except Exception as e:
+            logger.debug("Loan backfill skipped (already exists): %s", e)
+            cursor.execute("ROLLBACK TO SAVEPOINT sp_loan_backfill")
+
+        # Backfill payment_number for payments missing one (NULL only — never overwrite)
+        try:
+            cursor.execute("SAVEPOINT sp_pay_backfill")
+            cursor.execute("""
+                WITH missing AS (
+                    SELECT id, tenant_id, ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY created_at) AS rn
+                    FROM payments
+                    WHERE payment_number IS NULL
+                ),
+                max_seq AS (
+                    SELECT tenant_id, COALESCE(MAX(
+                        CASE WHEN payment_number ~ '^PAY-[0-9]+$'
+                             THEN CAST(SPLIT_PART(payment_number, '-', 2) AS INT)
+                             ELSE 0 END
+                    ), 0) AS val FROM payments GROUP BY tenant_id
+                )
+                UPDATE payments p
+                SET payment_number = 'PAY-' || (max_seq.val + missing.rn)
+                FROM missing
+                JOIN max_seq ON max_seq.tenant_id = missing.tenant_id
+                WHERE p.id = missing.id
+            """)
+            cursor.execute("""
+                INSERT INTO payment_sequence (tenant_id, current_value)
+                SELECT tenant_id, COALESCE(MAX(
+                    CASE WHEN payment_number ~ '^PAY-[0-9]+$'
+                         THEN CAST(SPLIT_PART(payment_number, '-', 2) AS INT)
+                         ELSE 0 END
+                ), 0)
+                FROM payments WHERE payment_number IS NOT NULL
+                GROUP BY tenant_id
+                ON CONFLICT (tenant_id)
+                DO UPDATE SET current_value = GREATEST(
+                    payment_sequence.current_value, excluded.current_value
+                )
+            """)
+            cursor.execute("RELEASE SAVEPOINT sp_pay_backfill")
+            logger.debug("Payment number backfill complete")
+        except Exception as e:
+            logger.debug("Payment backfill skipped (already exists): %s", e)
+            cursor.execute("ROLLBACK TO SAVEPOINT sp_pay_backfill")
+
+        # Backfill receipt_number for payments missing one (NULL only — never overwrite)
+        try:
+            cursor.execute("SAVEPOINT sp_rcpt_backfill")
+            cursor.execute("""
+                WITH missing AS (
+                    SELECT id, tenant_id, ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY created_at) AS rn
+                    FROM payments
+                    WHERE receipt_number IS NULL
+                ),
+                max_seq AS (
+                    SELECT tenant_id, COALESCE(MAX(
+                        CASE WHEN receipt_number ~ '^RCPT-[0-9]+$'
+                             THEN CAST(SPLIT_PART(receipt_number, '-', 2) AS INT)
+                             ELSE 0 END
+                    ), 0) AS val FROM payments GROUP BY tenant_id
+                )
+                UPDATE payments p
+                SET receipt_number = 'RCPT-' || (max_seq.val + missing.rn)
+                FROM missing
+                JOIN max_seq ON max_seq.tenant_id = missing.tenant_id
+                WHERE p.id = missing.id
+            """)
+            cursor.execute("""
+                INSERT INTO receipt_sequence (tenant_id, current_value)
+                SELECT tenant_id, COALESCE(MAX(
+                    CASE WHEN receipt_number ~ '^RCPT-[0-9]+$'
+                         THEN CAST(SPLIT_PART(receipt_number, '-', 2) AS INT)
+                         ELSE 0 END
+                ), 0)
+                FROM payments WHERE receipt_number IS NOT NULL
+                GROUP BY tenant_id
+                ON CONFLICT (tenant_id)
+                DO UPDATE SET current_value = GREATEST(
+                    receipt_sequence.current_value, excluded.current_value
+                )
+            """)
+            cursor.execute("RELEASE SAVEPOINT sp_rcpt_backfill")
+            logger.debug("Receipt number backfill complete")
+        except Exception as e:
+            logger.debug("Receipt backfill skipped (already exists): %s", e)
+            cursor.execute("ROLLBACK TO SAVEPOINT sp_rcpt_backfill")$')
                                  THEN CAST(SPLIT_PART(loan_number, '-', 2) AS INT)
                                  ELSE 0 END
                         ), 0) AS val FROM loans WHERE loan_type = %s
@@ -1178,6 +1384,19 @@ def create_sample_data(conn):
     cursor.execute("INSERT INTO gold_rate_settings (id, tenant_id, mode) VALUES (%s, %s, 'manual') ON CONFLICT (tenant_id) DO NOTHING",
         (str(uuid.uuid4()), tenant_id)
     )
+
+    # Seed per-tenant sequences
+    for lt in ('gold_loan', 'personal_loan', 'vehicle_loan'):
+        cursor.execute("""
+            INSERT INTO loan_sequences (tenant_id, loan_type, current_value)
+            VALUES (%s, %s, 0) ON CONFLICT DO NOTHING
+        """, (tenant_id, lt))
+    cursor.execute("""
+        INSERT INTO payment_sequence (tenant_id, current_value) VALUES (%s, 0) ON CONFLICT DO NOTHING
+    """, (tenant_id,))
+    cursor.execute("""
+        INSERT INTO receipt_sequence (tenant_id, current_value) VALUES (%s, 0) ON CONFLICT DO NOTHING
+    """, (tenant_id,))
 
     conn.commit()
 
@@ -1963,6 +2182,19 @@ async def register_business(request: RegisterBusinessRequest):
             get_ist_now().isoformat()
         ))
 
+        # Seed per-tenant sequences
+        for lt in ('gold_loan', 'personal_loan', 'vehicle_loan'):
+            cursor.execute("""
+                INSERT INTO loan_sequences (tenant_id, loan_type, current_value)
+                VALUES (%s, %s, 0) ON CONFLICT DO NOTHING
+            """, (tenant_id, lt))
+        cursor.execute("""
+            INSERT INTO payment_sequence (tenant_id, current_value) VALUES (%s, 0) ON CONFLICT DO NOTHING
+        """, (tenant_id,))
+        cursor.execute("""
+            INSERT INTO receipt_sequence (tenant_id, current_value) VALUES (%s, 0) ON CONFLICT DO NOTHING
+        """, (tenant_id,))
+
         conn.commit()
 
         return {
@@ -2208,13 +2440,16 @@ async def apply_for_loan(
         # 7️⃣ Insert loan
         loan_id = str(uuid.uuid4())
 
-        # Generate loan_number (GL-N / PL-N / VL-N)
+        # Generate loan_number (GL-N / PL-N / VL-N) — global per tenant
         prefix_map = {'gold_loan': 'GL', 'personal_loan': 'PL', 'vehicle_loan': 'VL'}
         ln_prefix = prefix_map.get(request.loan_type, 'LN')
         cursor.execute("""
-            UPDATE loan_sequences SET current_value = current_value + 1
-            WHERE loan_type = %s RETURNING current_value
-        """, (request.loan_type,))
+            INSERT INTO loan_sequences (tenant_id, loan_type, current_value)
+            VALUES (%s, %s, 1)
+            ON CONFLICT (tenant_id, loan_type)
+            DO UPDATE SET current_value = loan_sequences.current_value + 1
+            RETURNING current_value
+        """, (tenant_id, request.loan_type))
         ln_row = cursor.fetchone()
         loan_number = f"{ln_prefix}-{ln_row['current_value']}" if ln_row else None
 
@@ -2968,11 +3203,14 @@ async def enter_payment(
 
         # 2️⃣ ATOMIC INSERT (DB WILL BLOCK DUPLICATES)
         try:
-            # Generate payment_number
+            # Generate payment_number — global per tenant
             cursor.execute("""
-                UPDATE payment_sequence SET current_value = current_value + 1
-                WHERE id = 1 RETURNING current_value
-            """)
+                INSERT INTO payment_sequence (tenant_id, current_value)
+                VALUES (%s, 1)
+                ON CONFLICT (tenant_id)
+                DO UPDATE SET current_value = payment_sequence.current_value + 1
+                RETURNING current_value
+            """, (tenant_id,))
             pn_row = cursor.fetchone()
             payment_number = f"PAY-{pn_row['current_value']}" if pn_row else None
 
@@ -3816,15 +4054,15 @@ async def approve_payment(
             
             year = get_ist_now().year
 
+            # Receipt sequence — global per tenant (no branch dependency)
             cursor.execute("""
-                INSERT INTO payments_receipt_counter(branch_id, tenant_id, last_seq)
-                VALUES (%s, %s, 1)
-                ON CONFLICT(branch_id, tenant_id)
-                DO UPDATE SET last_seq = payments_receipt_counter.last_seq + 1
-                RETURNING last_seq
-            """, (branch_id, tenant_id))
-
-            next_seq = cursor.fetchone()['last_seq']
+                INSERT INTO receipt_sequence (tenant_id, current_value)
+                VALUES (%s, 1)
+                ON CONFLICT (tenant_id)
+                DO UPDATE SET current_value = receipt_sequence.current_value + 1
+                RETURNING current_value
+            """, (tenant_id,))
+            next_seq = cursor.fetchone()['current_value']
 
             # 🔥 GET TENANT NAME
             cursor.execute("SELECT name FROM tenants WHERE id = %s",
@@ -3839,13 +4077,8 @@ async def approve_payment(
             # 🔥 FINAL RECEIPT NUMBER
             receipt_no = f"{prefix}-REC-{year}-{str(next_seq).zfill(6)}"
 
-            # Generate simple receipt_number (RCPT-N)
-            cursor.execute("""
-                UPDATE receipt_sequence SET current_value = current_value + 1
-                WHERE id = 1 RETURNING current_value
-            """)
-            rn_row = cursor.fetchone()
-            receipt_number = f"RCPT-{rn_row['current_value']}" if rn_row else None
+            # Simple RCPT-N number (same sequence, no branch)
+            receipt_number = f"RCPT-{next_seq}"
 
             # ✅ 8. Count remaining EMIs AFTER this payment
             cursor.execute("""
