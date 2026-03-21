@@ -947,12 +947,15 @@ def init_db():
             # Sync sequences to max existing values
             for lt in ['gold_loan', 'personal_loan', 'vehicle_loan']:
                 cursor.execute("""
-                    UPDATE loan_sequences
-                    SET current_value = COALESCE((
+                    UPDATE loan_sequences ls
+                    SET current_value = GREATEST(ls.current_value, COALESCE((
                         SELECT MAX(CAST(SPLIT_PART(loan_number, '-', 2) AS INT))
-                        FROM loans WHERE loan_type = %s AND loan_number IS NOT NULL
+                        FROM loans
+                        WHERE loan_type = %s
+                          AND tenant_id = ls.tenant_id
+                          AND loan_number IS NOT NULL
                           AND loan_number ~ '^[A-Z]+-[0-9]+$'
-                    ), 0)
+                    ), 0))
                     WHERE loan_type = %s
                 """, (lt, lt))
             cursor.execute("RELEASE SAVEPOINT sp_loan_backfill")
@@ -961,38 +964,72 @@ def init_db():
             logger.debug("Loan backfill skipped (already exists): %s", e)
             cursor.execute("ROLLBACK TO SAVEPOINT sp_loan_backfill")
 
+        # ── Unconditional sequence sync: ensure sequences match actual MAX values ──
+        # Runs on every startup to fix any stale/out-of-sync counters
+        try:
+            # Sync loan_sequences per tenant per loan_type
+            for lt in ['gold_loan', 'personal_loan', 'vehicle_loan']:
+                cursor.execute("""
+                    UPDATE loan_sequences ls
+                    SET current_value = GREATEST(ls.current_value, COALESCE((
+                        SELECT MAX(CAST(SPLIT_PART(loan_number, '-', 2) AS INT))
+                        FROM loans
+                        WHERE loan_type = %s
+                          AND tenant_id = ls.tenant_id
+                          AND loan_number IS NOT NULL
+                          AND loan_number ~ '^[A-Z]+-[0-9]+$'
+                    ), 0))
+                    WHERE loan_type = %s
+                """, (lt, lt))
+
+            # Sync payment_sequence per tenant
+            cursor.execute("""
+                UPDATE payment_sequence ps
+                SET current_value = GREATEST(ps.current_value, COALESCE((
+                    SELECT MAX(CAST(SPLIT_PART(payment_number, '-', 2) AS INT))
+                    FROM payments
+                    WHERE tenant_id = ps.tenant_id
+                      AND payment_number IS NOT NULL
+                      AND payment_number ~ '^PAY-[0-9]+$'
+                ), 0))
+            """)
+
+            # Sync receipt_sequence per tenant
+            cursor.execute("""
+                UPDATE receipt_sequence rs
+                SET current_value = GREATEST(rs.current_value, COALESCE((
+                    SELECT MAX(CAST(SPLIT_PART(receipt_number, '-', 2) AS INT))
+                    FROM payments
+                    WHERE tenant_id = rs.tenant_id
+                      AND receipt_number IS NOT NULL
+                      AND receipt_number ~ '^RCPT-[0-9]+$'
+                ), 0))
+            """)
+            logger.info("✓ Sequence sync complete (loan/payment/receipt)")
+        except Exception as e:
+            logger.warning("Sequence sync skipped: %s", e)
+
         # Backfill payment_number for payments missing one (NULL only — never overwrite)
         try:
             cursor.execute("SAVEPOINT sp_pay_backfill")
             cursor.execute("""
                 WITH missing AS (
-                    SELECT id, ROW_NUMBER() OVER (ORDER BY created_at) AS rn
+                    SELECT id, tenant_id, ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY created_at) AS rn
                     FROM payments
                     WHERE payment_number IS NULL
                 ),
                 max_seq AS (
-                    SELECT COALESCE(MAX(
+                    SELECT tenant_id, COALESCE(MAX(
                         CASE WHEN payment_number ~ '^PAY-[0-9]+$'
                              THEN CAST(SPLIT_PART(payment_number, '-', 2) AS INT)
                              ELSE 0 END
-                    ), 0) AS val FROM payments
+                    ), 0) AS val FROM payments GROUP BY tenant_id
                 )
                 UPDATE payments p
                 SET payment_number = 'PAY-' || (max_seq.val + missing.rn)
-                FROM missing, max_seq
+                FROM missing
+                JOIN max_seq ON max_seq.tenant_id = missing.tenant_id
                 WHERE p.id = missing.id
-            """)
-            cursor.execute("""
-                UPDATE payment_sequence
-                SET current_value = COALESCE((
-                    SELECT MAX(
-                        CASE WHEN payment_number ~ '^PAY-[0-9]+$'
-                             THEN CAST(SPLIT_PART(payment_number, '-', 2) AS INT)
-                             ELSE 0 END
-                    )
-                    FROM payments WHERE payment_number IS NOT NULL
-                ), 0)
-                WHERE id = 1
             """)
             cursor.execute("RELEASE SAVEPOINT sp_pay_backfill")
             logger.debug("Payment number backfill complete")
@@ -1005,33 +1042,36 @@ def init_db():
             cursor.execute("SAVEPOINT sp_rcpt_backfill")
             cursor.execute("""
                 WITH missing AS (
-                    SELECT id, ROW_NUMBER() OVER (ORDER BY created_at) AS rn
+                    SELECT id, tenant_id, ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY created_at) AS rn
                     FROM payments
                     WHERE receipt_number IS NULL
                 ),
                 max_seq AS (
-                    SELECT COALESCE(MAX(
+                    SELECT tenant_id, COALESCE(MAX(
                         CASE WHEN receipt_number ~ '^RCPT-[0-9]+$'
                              THEN CAST(SPLIT_PART(receipt_number, '-', 2) AS INT)
                              ELSE 0 END
-                    ), 0) AS val FROM payments
+                    ), 0) AS val FROM payments GROUP BY tenant_id
                 )
                 UPDATE payments p
                 SET receipt_number = 'RCPT-' || (max_seq.val + missing.rn)
-                FROM missing, max_seq
+                FROM missing
+                JOIN max_seq ON max_seq.tenant_id = missing.tenant_id
                 WHERE p.id = missing.id
             """)
             cursor.execute("""
-                UPDATE receipt_sequence
-                SET current_value = COALESCE((
-                    SELECT MAX(
-                        CASE WHEN receipt_number ~ '^RCPT-[0-9]+$'
-                             THEN CAST(SPLIT_PART(receipt_number, '-', 2) AS INT)
-                             ELSE 0 END
-                    )
-                    FROM payments WHERE receipt_number IS NOT NULL
+                INSERT INTO receipt_sequence (tenant_id, current_value)
+                SELECT tenant_id, COALESCE(MAX(
+                    CASE WHEN receipt_number ~ '^RCPT-[0-9]+$'
+                         THEN CAST(SPLIT_PART(receipt_number, '-', 2) AS INT)
+                         ELSE 0 END
                 ), 0)
-                WHERE id = 1
+                FROM payments WHERE receipt_number IS NOT NULL
+                GROUP BY tenant_id
+                ON CONFLICT (tenant_id)
+                DO UPDATE SET current_value = GREATEST(
+                    receipt_sequence.current_value, excluded.current_value
+                )
             """)
             cursor.execute("RELEASE SAVEPOINT sp_rcpt_backfill")
             logger.debug("Receipt number backfill complete")
