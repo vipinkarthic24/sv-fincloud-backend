@@ -628,12 +628,14 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_customers_tenant ON customers(tenant_id, branch_id)")
 
         # Partial unique index: prevent duplicate active vehicle loans across the entire system
+        # Drop old index (narrower WHERE clause) and recreate with full active-status coverage
         try:
             cursor.execute("SAVEPOINT sp_vehicle_idx")
+            cursor.execute("DROP INDEX IF EXISTS unique_active_vehicle_loan")
             cursor.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS unique_active_vehicle_loan
+                CREATE UNIQUE INDEX unique_active_vehicle_loan
                 ON loans (UPPER(REPLACE(COALESCE(vehicle_reg_no, ''), ' ', '')))
-                WHERE status IN ('active', 'approved', 'disbursed')
+                WHERE status IN ('pending', 'pre-approved', 'active', 'approved', 'disbursed')
             """)
             cursor.execute("RELEASE SAVEPOINT sp_vehicle_idx")
         except Exception as e:
@@ -2418,24 +2420,6 @@ async def apply_for_loan(
             }
         # Update customer's monthly income
         cursor.execute("""UPDATE customers SET monthly_income = %s WHERE id = %s""", (request.monthly_income, customer["id"]))
-        # ═══════════════════════════════════════
-        # VEHICLE COLLATERAL LOCK CHECK (global)
-        # ═══════════════════════════════════════
-        if request.loan_type == "vehicle_loan" and request.vehicle_reg_no:
-            _vno2 = request.vehicle_reg_no.strip().upper().replace(" ", "")
-            cursor.execute("""
-                SELECT id FROM loans
-                WHERE UPPER(REPLACE(COALESCE(vehicle_reg_no, ''), ' ', '')) = %s
-                  AND status IN ('pending', 'pre-approved', 'active', 'approved', 'disbursed')
-            """, (_vno2,))
-
-            existing_loan = cursor.fetchone()
-
-            if existing_loan:
-                raise HTTPException(
-                    status_code=400,
-                    detail="This vehicle already has an active loan in the system. The previous loan must be closed before applying for a new one."
-                )
         # 7️⃣ Insert loan
         loan_id = str(uuid.uuid4())
 
@@ -3845,7 +3829,7 @@ async def approve_loan(data: dict, token_data: dict = Depends(require_role(['fin
                 cursor.execute("""
                     SELECT id FROM loans
                     WHERE UPPER(REPLACE(COALESCE(vehicle_reg_no, ''), ' ', '')) = %s
-                      AND status IN ('active', 'approved', 'disbursed')
+                      AND status IN ('pending', 'pre-approved', 'active', 'approved', 'disbursed')
                       AND id != %s
                 """, (vehicle_reg_no.replace(' ', ''), loan_id))
                 if cursor.fetchone():
