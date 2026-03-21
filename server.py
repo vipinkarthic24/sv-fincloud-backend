@@ -59,7 +59,7 @@ from services.gold_rate_service import get_gold_rate_for_branch
 
 
 
-ROOT_DIR = Path(__file__).parent
+ROOT_DIR = Path(__file__).parent  # deploy: docker-build-v2
 load_dotenv(ROOT_DIR / '.env')
 
 _log_level = os.getenv("LOG_LEVEL", "INFO").upper()

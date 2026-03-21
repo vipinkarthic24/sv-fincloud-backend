@@ -8,12 +8,13 @@ ARG REACT_APP_API_URL=https://web-production-4b6d21.up.railway.app
 ENV REACT_APP_BACKEND_URL=$REACT_APP_BACKEND_URL
 ENV REACT_APP_API_URL=$REACT_APP_API_URL
 
-# Clone the frontend repo
+# Clone the frontend repo and build
 RUN apk add --no-cache git && \
     git clone https://github.com/vipinkarthic24/sv-fincloud-frontend.git .
 
-RUN yarn install --frozen-lockfile
-RUN yarn build
+# Use npm (avoids yarn.lock mismatch issues)
+RUN npm install --legacy-peer-deps
+RUN npm run build
 
 # ── Stage 2: Python / FastAPI backend ────────────────────────────────────────
 FROM python:3.11-slim
@@ -34,4 +35,5 @@ COPY --from=frontend-builder /frontend/build ./frontend/build
 
 EXPOSE 8000
 
-CMD ["gunicorn", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "server:app", "--bind", "0.0.0.0:$PORT"]
+# Use shell form so $PORT is expanded at runtime
+CMD gunicorn -w 1 -k uvicorn.workers.UvicornWorker server:app --bind 0.0.0.0:${PORT:-8000}
