@@ -943,16 +943,7 @@ def init_db():
             logger.debug("Receipt number backfill complete")
         except Exception as e:
             logger.debug("Receipt backfill skipped (already exists): %s", e)
-            cursor.execute("ROLLBACK TO SAVEPOINT sp_rcpt_backfill")$')
-                                 THEN CAST(SPLIT_PART(loan_number, '-', 2) AS INT)
-                                 ELSE 0 END
-                        ), 0) AS val FROM loans WHERE loan_type = %s
-                    )
-                    UPDATE loans l
-                    SET loan_number = %s || '-' || (max_seq.val + missing.rn)
-                    FROM missing, max_seq
-                    WHERE l.id = missing.id
-                """, (lt, prefix, lt, prefix))
+            cursor.execute("ROLLBACK TO SAVEPOINT sp_rcpt_backfill")
             # Sync sequences to max existing values
             for lt in ['gold_loan', 'personal_loan', 'vehicle_loan']:
                 cursor.execute("""
