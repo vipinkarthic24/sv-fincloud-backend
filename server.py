@@ -10006,12 +10006,41 @@ async def get_public_gold_rate(token_data: dict = Depends(verify_token)):
             cursor.execute("""
                 SELECT rate_per_gram, updated_at, source
                 FROM gold_rate
-                WHERE tenant_id = %s AND branch_id = %s
+                WHERE tenant_id = %s AND branch_id = %s AND source = %s
                 ORDER BY updated_at DESC LIMIT 1
-            """, (tenant_id, user_branch_id))
+            """, (tenant_id, user_branch_id, settings_mode))
             row = cursor.fetchone()
 
             if not row:
+                # Fallback: global rate matching current mode
+                cursor.execute("""
+                    SELECT rate_per_gram, updated_at, source
+                    FROM gold_rate
+                    WHERE tenant_id = %s AND branch_id IS NULL AND source = %s
+                    ORDER BY updated_at DESC LIMIT 1
+                """, (tenant_id, settings_mode))
+                row = cursor.fetchone()
+
+            if not row:
+                # Last resort: any rate for this branch
+                cursor.execute("""
+                    SELECT rate_per_gram, updated_at, source
+                    FROM gold_rate
+                    WHERE tenant_id = %s AND branch_id = %s
+                    ORDER BY updated_at DESC LIMIT 1
+                """, (tenant_id, user_branch_id))
+                row = cursor.fetchone()
+        else:
+            cursor.execute("""
+                SELECT rate_per_gram, updated_at, source
+                FROM gold_rate
+                WHERE tenant_id = %s AND branch_id IS NULL AND source = %s
+                ORDER BY updated_at DESC LIMIT 1
+            """, (tenant_id, settings_mode))
+            row = cursor.fetchone()
+
+            if not row:
+                # Fallback: any global rate
                 cursor.execute("""
                     SELECT rate_per_gram, updated_at, source
                     FROM gold_rate
@@ -10019,14 +10048,6 @@ async def get_public_gold_rate(token_data: dict = Depends(verify_token)):
                     ORDER BY updated_at DESC LIMIT 1
                 """, (tenant_id,))
                 row = cursor.fetchone()
-        else:
-            cursor.execute("""
-                SELECT rate_per_gram, updated_at, source
-                FROM gold_rate
-                WHERE tenant_id = %s AND branch_id IS NULL
-                ORDER BY updated_at DESC LIMIT 1
-            """, (tenant_id,))
-            row = cursor.fetchone()
 
         if not row:
             return {"rate_per_gram": 0, "mode": settings_mode, "source": settings_mode}
