@@ -92,6 +92,25 @@ except RuntimeError:
 
 logger.debug("DATABASE: %s", os.getenv("DB_HOST"))
 
+# ── Simple TTL cache for expensive admin aggregate endpoints ─────────────────
+# Stores: { cache_key: (result, expiry_timestamp) }
+_CACHE: dict = {}
+_CACHE_TTL = 300  # 5 minutes
+
+def _cache_get(key: str):
+    entry = _CACHE.get(key)
+    if entry and datetime.now(timezone.utc).timestamp() < entry[1]:
+        return entry[0]
+    return None
+
+def _cache_set(key: str, value, ttl: int = _CACHE_TTL):
+    _CACHE[key] = (value, datetime.now(timezone.utc).timestamp() + ttl)
+
+def _cache_invalidate_prefix(prefix: str):
+    for k in list(_CACHE.keys()):
+        if k.startswith(prefix):
+            del _CACHE[k]
+
 # JWT Configuration
 SECRET_KEY = os.environ.get(
     'JWT_SECRET_KEY',
@@ -119,12 +138,12 @@ def init_db_pool():
                 db_url = db_url.replace("postgresql://", "postgres://", 1)
             # Pass the DSN string directly — avoids any URL-parsing issues
             # with special characters (e.g. # in passwords)
-            db_pool = SimpleConnectionPool(minconn=1, maxconn=10, dsn=db_url)
+            db_pool = SimpleConnectionPool(minconn=5, maxconn=20, dsn=db_url)
             logger.info("Connection pool initialized from DATABASE_URL")
         else:
             # Local / dev fallback — individual env vars
             db_pool = SimpleConnectionPool(
-                1, 10,
+                5, 20,
                 host=os.getenv("DB_HOST"),
                 port=int(os.getenv("DB_PORT", 6543)),
                 database=os.getenv("DB_NAME", "postgres"),
@@ -598,6 +617,15 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_loans_tenant_branch ON loans(tenant_id, branch_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_payments_loan ON payments(loan_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_emi_loan ON emi_schedule(loan_id)")
+        # Performance indexes for admin aggregate queries
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_loans_tenant_status ON loans(tenant_id, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_loans_created_at ON loans(created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_payments_tenant_status ON payments(tenant_id, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_payments_branch_status ON payments(branch_id, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_emi_status ON emi_schedule(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_gold_rate_tenant ON gold_rate(tenant_id, updated_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_repo_rate_tenant ON repo_rate_history(tenant_id, fetched_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_customers_tenant ON customers(tenant_id, branch_id)")
 
         # Repo Rate History table (for dynamic lending engine)
         cursor.execute('''
@@ -1323,6 +1351,17 @@ async def lifespan(app: FastAPI):
             # 1. Pool init (required — fast with connect_timeout=5)
             init_db_pool()
 
+            # 1b. Data migration from Supabase → Railway (one-shot, env-gated)
+            if os.getenv("RUN_MIGRATION", "").lower() == "true":
+                logger.info("RUN_MIGRATION=true detected — starting data migration...")
+                try:
+                    from migrate import main as run_migration
+                    run_migration()
+                    logger.info("Data migration completed successfully.")
+                except Exception as _mig_err:
+                    logger.error("Data migration FAILED: %s", _mig_err)
+                    # Do not abort startup — app still runs after migration attempt
+
             # 2. Schema migrations (idempotent — ADD COLUMN IF NOT EXISTS)
             init_db()
 
@@ -1406,6 +1445,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 api_router = APIRouter(prefix="/api")
+
+# Register CORS before routes so it wraps all requests correctly
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # Pydantic Models
@@ -7880,6 +7928,8 @@ async def update_gold_rate(
         log_audit(conn, token_data['user_id'], tenant_id, 'GOLD_RATE_MANUAL_UPDATE', 'gold_rate',
                   details=json.dumps({"branch_id": branch_id, "rate_per_gram": request.rate_per_gram, "source": "manual"}))
 
+        _cache_invalidate_prefix(f"gold_rate:{tenant_id}")
+
         return {
             "message": f"Gold rate updated successfully for {branches_updated} branch(es) (mode set to manual)",
             "branch_id": branch_id,
@@ -7948,15 +7998,21 @@ async def get_gold_rate(
     branch_id: Optional[str] = None,
     token_data: dict = Depends(require_role(['admin', 'super_admin']))
 ):
+    tenant_id = token_data["tenant_id"]
+
+    # Branch validation
+    if token_data["role"] == "admin":
+        if branch_id and branch_id != token_data.get("branch_id"):
+            raise HTTPException(403, "Access denied to this branch")
+        branch_id = token_data.get("branch_id")
+
+    cache_key = f"gold_rate:{tenant_id}:{branch_id}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
     with get_db() as conn:
         cursor = conn.cursor()
-        tenant_id = token_data["tenant_id"]
-
-        # Branch validation
-        if token_data["role"] == "admin":
-            if branch_id and branch_id != token_data.get("branch_id"):
-                raise HTTPException(403, "Access denied to this branch")
-            branch_id = token_data.get("branch_id")
 
         # Single query: resolve mode and fetch rate in one round-trip
         if branch_id and branch_id != "ALL":
@@ -8010,11 +8066,14 @@ async def get_gold_rate(
             conn.commit()
             return {"rate_per_gram": default_rate, "updated_at": ts, "mode": mode}
 
-        return {
+        result = {
             "rate_per_gram": row["rate_per_gram"],
             "updated_at": row["updated_at"],
             "mode": row["mode"]
         }
+
+    _cache_set(cache_key, result)
+    return result
         
 @api_router.post("/admin/gold-rate-mode")
 async def set_gold_rate_mode(
@@ -8399,100 +8458,107 @@ async def interest_report(
 async def get_admin_stats(branch_id: Optional[str] = None, token_data: dict = Depends(require_role(['admin','super_admin']))):
     if not check_permission(token_data['role'], 'reports', 'view'):
         raise HTTPException(403, "Access denied")
+
+    tenant_id = token_data["tenant_id"]
+    role = token_data["role"]
+
+    # Build branch filter
+    branch_filter_loans = ""
+    branch_filter_users = ""
+    branch_filter_payments = ""
+    params_loans = [tenant_id]
+    params_users = [tenant_id]
+    params_payments = [tenant_id]
+
+    if role == "admin":
+        bid = token_data["branch_id"]
+        branch_filter_loans = " AND branch_id = %s"
+        branch_filter_users = " AND branch_id = %s"
+        branch_filter_payments = " AND branch_id = %s"
+        params_loans.append(bid)
+        params_users.append(bid)
+        params_payments.append(bid)
+    elif role == "super_admin" and branch_id:
+        ids = branch_id.split(",")
+        placeholders = ",".join(["%s"] * len(ids))
+        branch_filter_loans = f" AND branch_id IN ({placeholders})"
+        branch_filter_users = f" AND branch_id IN ({placeholders})"
+        branch_filter_payments = f" AND branch_id IN ({placeholders})"
+        params_loans.extend(ids)
+        params_users.extend(ids)
+        params_payments.extend(ids)
+
+    cache_key = f"admin_stats:{tenant_id}:{role}:{branch_id}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
     with get_db() as conn:
         cursor = conn.cursor()
-        tenant_id = token_data["tenant_id"]
-        role = token_data["role"]
 
-        # 1. Prepare the branch filter logic
-        # If branch_id exists, we split it into a list and create placeholders like (?, ?)
-        branch_filter = ""
-        params = [tenant_id]
-
-       # Branch Admin → Only their branch
-        if role == "admin":
-            branch_filter = " AND branch_id = %s"
-            params.append(token_data["branch_id"])
-
-        # Super Admin → Optional branch filter
-        elif role == "super_admin" and branch_id:
-            ids = branch_id.split(",")
-            placeholders = ",".join(["%s"] * len(ids))
-            branch_filter = f" AND branch_id IN ({placeholders})"
-            params.extend(ids)
-
-        else:
-            branch_filter = ""
-            params = [tenant_id]
-
-        # TOTAL USERS
-        cursor.execute(f"SELECT COUNT(*) as total FROM users WHERE tenant_id = %s {branch_filter}", params)
-        total_users = cursor.fetchone()['total']
-
-        # TOTAL CUSTOMERS 
-        cursor.execute(f"SELECT COUNT(*) as total FROM customers WHERE tenant_id = %s {branch_filter}", params)
-        total_customers = cursor.fetchone()['total']
-
-        # PENDING LOANS
-        cursor.execute(f"SELECT COUNT(*) as total FROM loans WHERE status='pending' AND tenant_id = %s {branch_filter}", params)
-        pending_loans = cursor.fetchone()['total']
-
-        # APPROVED (ACTIVE) LOANS
-        cursor.execute(f"SELECT COUNT(*) as total FROM loans WHERE status='active' AND tenant_id = %s {branch_filter}", params)
-        active_loans = cursor.fetchone()['total']
-
-        # TOTAL LOANS (all non-pending — for avg loan size, matches disbursed filter)
-        cursor.execute(f"SELECT COUNT(*) as total FROM loans WHERE status != 'pending' AND tenant_id = %s {branch_filter}", params)
-        total_loans = cursor.fetchone()['total']
-
-        # TOTAL DISBURSED — lifetime, all non-pending loans (active + closed), no joins to avoid duplication
-        cursor.execute(f"SELECT COALESCE(SUM(amount), 0) as total FROM loans WHERE status != 'pending' AND tenant_id = %s {branch_filter}", params)
-        total_disbursed = cursor.fetchone()['total'] or 0
-
-        # TOTAL OUTSTANDING — active loans only
-        cursor.execute(f"SELECT COALESCE(SUM(outstanding_balance), 0) as total FROM loans WHERE status='active' AND tenant_id = %s {branch_filter}", params)
-        total_outstanding = cursor.fetchone()['total'] or 0
-
-        # TOTAL COLLECTED — all approved payments
-        cursor.execute(f"SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status='approved' AND tenant_id = %s {branch_filter}", params)
-        total_collected = cursor.fetchone()['total'] or 0
+        # Single query for all loan aggregates
         cursor.execute(f"""
             SELECT
-            SUM(CASE WHEN loan_type='gold_loan' THEN 1 ELSE 0 END) as gold_loans,
-            SUM(CASE WHEN loan_type='personal_loan' THEN 1 ELSE 0 END) as personal_loans,
-            SUM(CASE WHEN loan_type='vehicle_loan' THEN 1 ELSE 0 END) as vehicle_loans
+                COUNT(*) FILTER (WHERE status = 'pending')                          AS pending_loans,
+                COUNT(*) FILTER (WHERE status = 'active')                           AS active_loans,
+                COUNT(*) FILTER (WHERE status != 'pending')                         AS total_loans,
+                COALESCE(SUM(amount) FILTER (WHERE status != 'pending'), 0)         AS total_disbursed,
+                COALESCE(SUM(outstanding_balance) FILTER (WHERE status = 'active'), 0) AS total_outstanding,
+                COALESCE(SUM(CASE WHEN loan_type='gold_loan'     AND status='active' THEN 1 ELSE 0 END), 0) AS gold_loans,
+                COALESCE(SUM(CASE WHEN loan_type='personal_loan' AND status='active' THEN 1 ELSE 0 END), 0) AS personal_loans,
+                COALESCE(SUM(CASE WHEN loan_type='vehicle_loan'  AND status='active' THEN 1 ELSE 0 END), 0) AS vehicle_loans
             FROM loans
-            WHERE tenant_id=%s AND status='active'
-            {branch_filter}
-            """, params)
+            WHERE tenant_id = %s {branch_filter_loans}
+        """, params_loans)
+        loan_row = cursor.fetchone()
 
-        loan_types = cursor.fetchone()
+        # Single query for payments aggregate
+        cursor.execute(f"""
+            SELECT COALESCE(SUM(amount), 0) AS total_collected
+            FROM payments
+            WHERE status = 'approved' AND tenant_id = %s {branch_filter_payments}
+        """, params_payments)
+        pay_row = cursor.fetchone()
 
-        return {
+        # Users and customers counts
+        cursor.execute(f"SELECT COUNT(*) AS total FROM users WHERE tenant_id = %s {branch_filter_users}", params_users)
+        total_users = cursor.fetchone()['total']
+
+        cursor.execute(f"SELECT COUNT(*) AS total FROM customers WHERE tenant_id = %s {branch_filter_loans}", params_loans)
+        total_customers = cursor.fetchone()['total']
+
+        result = {
             "total_users": total_users,
             "total_customers": total_customers,
-            "pending_loans": pending_loans,
-            "approved_loans": active_loans,
-            "total_loans": total_loans,
-            "total_disbursed": total_disbursed,
-            "total_outstanding": total_outstanding,
-            "total_collected": total_collected,
-            "gold_loans": loan_types["gold_loans"] or 0,
-            "personal_loans": loan_types["personal_loans"] or 0,
-            "vehicle_loans": loan_types["vehicle_loans"] or 0
+            "pending_loans": loan_row["pending_loans"] or 0,
+            "approved_loans": loan_row["active_loans"] or 0,
+            "total_loans": loan_row["total_loans"] or 0,
+            "total_disbursed": float(loan_row["total_disbursed"] or 0),
+            "total_outstanding": float(loan_row["total_outstanding"] or 0),
+            "total_collected": float(pay_row["total_collected"] or 0),
+            "gold_loans": loan_row["gold_loans"] or 0,
+            "personal_loans": loan_row["personal_loans"] or 0,
+            "vehicle_loans": loan_row["vehicle_loans"] or 0,
         }
+
+    _cache_set(cache_key, result)
+    return result
 
 @api_router.get("/admin/interest-earned")
 async def get_interest_earned(
     branch_id: Optional[str] = None,
     token_data: dict = Depends(require_role(['admin','super_admin']))
 ):
+    tenant_id = token_data["tenant_id"]
+    role = token_data["role"]
+
+    cache_key = f"interest_earned:{tenant_id}:{role}:{branch_id}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
 
     with get_db() as conn:
         cursor = conn.cursor()
-
-        tenant_id = token_data["tenant_id"]
-        role = token_data["role"]
 
         query = """
             SELECT COALESCE(SUM(e.interest_amount), 0) AS interest_earned
@@ -8504,12 +8570,9 @@ async def get_interest_earned(
 
         params = [tenant_id]
 
-        # Branch admin → only their branch
         if role == "admin":
             query += " AND l.branch_id = %s"
             params.append(token_data["branch_id"])
-
-        # Super admin → optional branch filter
         elif role == "super_admin" and branch_id:
             ids = branch_id.split(",")
             placeholders = ",".join(["%s"] * len(ids))
@@ -8517,11 +8580,10 @@ async def get_interest_earned(
             params.extend(ids)
 
         cursor.execute(query, params)
-        result = cursor.fetchone()
+        result = {"interest_earned": round(cursor.fetchone()["interest_earned"], 2)}
 
-        return {
-            "interest_earned": round(result["interest_earned"], 2)
-        }
+    _cache_set(cache_key, result)
+    return result
 
 @api_router.get("/admin/branch-loan-stats")
 async def branch_loan_stats(branch_id: Optional[str] = None,
@@ -8569,32 +8631,33 @@ async def branch_performance(
     branch_id: Optional[str] = None,
     token_data: dict = Depends(require_role(['admin','super_admin']))
 ):
-
     if not check_permission(token_data['role'], 'reports', 'view'):
         raise HTTPException(403, "Access denied")
+
+    tenant_id = token_data["tenant_id"]
+    role = token_data["role"]
+
+    cache_key = f"branch_performance:{tenant_id}:{role}:{branch_id}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
 
     with get_db() as conn:
         cursor = conn.cursor()
 
-        tenant_id = token_data["tenant_id"]
-        role = token_data["role"]
-
         branch_filter = ""
         params = [tenant_id]
 
-        # Branch admin → only their branch
         if role == "admin":
             branch_filter = " AND l.branch_id = %s"
             params.append(token_data["branch_id"])
-
-        # Super admin → optional branch filter
         elif role == "super_admin" and branch_id:
             ids = branch_id.split(",")
             placeholders = ",".join(["%s"] * len(ids))
             branch_filter = f" AND l.branch_id IN ({placeholders})"
             params.extend(ids)
 
-        query = f"""
+        cursor.execute(f"""
             SELECT b.name,
                    SUM(p.amount) as total_collected
             FROM payments p
@@ -8605,24 +8668,30 @@ async def branch_performance(
             {branch_filter}
             GROUP BY b.name
             ORDER BY total_collected DESC
-        """
+        """, params)
 
-        cursor.execute(query, params)
-
-        return [
+        result = [
             {"branch": row["name"], "collected": row["total_collected"] or 0}
             for row in cursor.fetchall()
         ]
+
+    _cache_set(cache_key, result)
+    return result
 @api_router.get("/admin/monthly-collections")
 async def monthly_collections(
     branch_id: Optional[str] = None,
     token_data: dict = Depends(require_role(['admin','super_admin']))
 ):
+    tenant_id = token_data["tenant_id"]
+    role = token_data["role"]
+
+    cache_key = f"monthly_collections:{tenant_id}:{role}:{branch_id}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
     with get_db() as conn:
         cursor = conn.cursor()
-
-        tenant_id = token_data["tenant_id"]
-        role = token_data["role"]
 
         branch_filter = ""
         params = [tenant_id]
@@ -8647,32 +8716,44 @@ async def monthly_collections(
             ORDER BY month
         """, params)
 
-        return [
+        result = [
             {"month": row["month"], "amount": row["amount"] or 0}
             for row in cursor.fetchall()
         ]
+
+    _cache_set(cache_key, result)
+    return result
 
 @api_router.get("/admin/repo-rate")
 async def get_repo_rate(token_data: dict = Depends(require_role(['admin', 'super_admin']))):
     """Return the latest RBI repo rate from history for this tenant."""
     tenant_id = token_data["tenant_id"]
+
+    cache_key = f"repo_rate:{tenant_id}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
     repo_data = get_latest_repo_rate(str(DB_PATH), tenant_id)
 
     if not repo_data:
-        # No history yet — fetch and seed for this tenant
         current_rate = fetch_repo_rate()
         save_repo_rate(str(DB_PATH), current_rate, tenant_id)
-        return {
+        result = {
             "repo_rate": current_rate,
             "fetched_at": get_ist_now().isoformat(),
             "source": "freshly_fetched"
         }
+        _cache_set(cache_key, result)
+        return result
 
-    return {
+    result = {
         "repo_rate": repo_data["repo_rate"],
         "fetched_at": repo_data["fetched_at"],
         "source": "database"
     }
+    _cache_set(cache_key, result)
+    return result
 @api_router.post("/admin/update-repo-rate")
 async def update_repo_rate(
     request: RepoRateUpdateRequest,
@@ -8681,6 +8762,7 @@ async def update_repo_rate(
     tenant_id = token_data["tenant_id"]
     save_repo_rate(str(DB_PATH), request.repo_rate, tenant_id)
     recalculate_interest_rates(str(DB_PATH), request.repo_rate, tenant_id)
+    _cache_invalidate_prefix(f"repo_rate:{tenant_id}")
 
     return {
         "message": f"Repo rate updated to {request.repo_rate}% and interest rates recalculated."
@@ -10075,14 +10157,6 @@ async def get_customer_interest_rates(
 
 # Include router
 app.include_router(api_router)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ── Bare health check — must be registered before the catch-all ──────────────
 # Railway healthcheck hits this before the DB is necessarily ready.
