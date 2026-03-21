@@ -7986,6 +7986,42 @@ async def download_avg_loan_report(
         )
 
 
+@api_router.post("/admin/resync-sequences")
+async def resync_sequences(token_data: dict = Depends(require_role(['super_admin']))):
+    """One-shot endpoint to renumber all loans globally per tenant and resync sequences."""
+    tenant_id = token_data["tenant_id"]
+    with get_db() as conn:
+        cursor = conn.cursor()
+        prefix_map = {'gold_loan': 'GL', 'personal_loan': 'PL', 'vehicle_loan': 'VL'}
+        updated = {}
+        for lt, prefix in prefix_map.items():
+            # Renumber all loans of this type for this tenant in created_at order
+            cursor.execute("""
+                WITH ranked AS (
+                    SELECT id,
+                           ROW_NUMBER() OVER (ORDER BY created_at ASC) AS rn
+                    FROM loans
+                    WHERE loan_type = %s AND tenant_id = %s
+                )
+                UPDATE loans l
+                SET loan_number = %s || '-' || ranked.rn
+                FROM ranked
+                WHERE l.id = ranked.id
+                RETURNING l.loan_number
+            """, (lt, tenant_id, prefix))
+            rows = cursor.fetchall()
+            # Sync sequence to max
+            cursor.execute("""
+                INSERT INTO loan_sequences (tenant_id, loan_type, current_value)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (tenant_id, loan_type)
+                DO UPDATE SET current_value = EXCLUDED.current_value
+            """, (tenant_id, lt, len(rows)))
+            updated[lt] = len(rows)
+        logger.info("resync-sequences: tenant=%s updated=%s", tenant_id, updated)
+        return {"status": "ok", "updated": updated}
+
+
 @api_router.post("/admin/create-branch")
 async def create_branch(request: BranchCreateRequest, token_data: dict = Depends(require_role(['super_admin']))):
     if not check_permission(token_data['role'], 'branches', 'insert'):
