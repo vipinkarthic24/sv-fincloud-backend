@@ -7993,6 +7993,52 @@ def insert_gold_rate(cursor, tenant_id, branch_id, rate, source):
     return now_ts
 
 
+def resolve_gold_rate(cursor, tenant_id, branch_id=None):
+    """
+    Single source of truth for gold rate resolution.
+    1. Reads mode from gold_rate_settings (defaults to 'manual').
+    2. Fetches rate matching that mode — branch-specific first, then global fallback.
+    Returns dict: { mode, rate_per_gram, updated_at }
+    """
+    cursor.execute("SELECT mode FROM gold_rate_settings WHERE tenant_id = %s", (tenant_id,))
+    mode_row = cursor.fetchone()
+    mode = mode_row["mode"] if mode_row else "manual"
+
+    row = None
+    if branch_id and branch_id != "ALL":
+        # Branch-specific rate matching mode
+        cursor.execute("""
+            SELECT rate_per_gram, updated_at FROM gold_rate
+            WHERE tenant_id = %s AND branch_id = %s AND source = %s
+            ORDER BY updated_at DESC LIMIT 1
+        """, (tenant_id, branch_id, mode))
+        row = cursor.fetchone()
+
+    if not row:
+        # Global rate matching mode
+        cursor.execute("""
+            SELECT rate_per_gram, updated_at FROM gold_rate
+            WHERE tenant_id = %s AND (branch_id IS NULL OR branch_id = 'ALL') AND source = %s
+            ORDER BY updated_at DESC LIMIT 1
+        """, (tenant_id, mode))
+        row = cursor.fetchone()
+
+    if not row:
+        # Last resort: any rate for tenant
+        cursor.execute("""
+            SELECT rate_per_gram, updated_at FROM gold_rate
+            WHERE tenant_id = %s
+            ORDER BY updated_at DESC LIMIT 1
+        """, (tenant_id,))
+        row = cursor.fetchone()
+
+    return {
+        "mode": mode,
+        "rate_per_gram": float(row["rate_per_gram"]) if row else 0.0,
+        "updated_at": row["updated_at"] if row else None,
+    }
+
+
 @api_router.get("/admin/gold-rate")
 async def get_gold_rate(
     branch_id: Optional[str] = None,
@@ -8013,66 +8059,17 @@ async def get_gold_rate(
 
     with get_db() as conn:
         cursor = conn.cursor()
+        result = resolve_gold_rate(cursor, tenant_id, branch_id)
 
-        # Single query: resolve mode and fetch rate in one round-trip
-        if branch_id and branch_id != "ALL":
-            cursor.execute("""
-                SELECT g.rate_per_gram, g.updated_at,
-                       COALESCE(s.mode, 'manual') AS mode
-                FROM gold_rate g
-                LEFT JOIN gold_rate_settings s ON s.tenant_id = g.tenant_id
-                WHERE g.tenant_id = %s
-                  AND g.branch_id = %s
-                  AND g.source = COALESCE((
-                      SELECT mode FROM gold_rate_settings WHERE tenant_id = %s
-                  ), 'manual')
-                ORDER BY g.updated_at DESC LIMIT 1
-            """, (tenant_id, branch_id, tenant_id))
-        else:
-            cursor.execute("""
-                SELECT g.rate_per_gram, g.updated_at,
-                       COALESCE(s.mode, 'manual') AS mode
-                FROM gold_rate g
-                LEFT JOIN gold_rate_settings s ON s.tenant_id = g.tenant_id
-                WHERE g.tenant_id = %s
-                  AND (g.branch_id IS NULL OR g.branch_id = 'ALL')
-                  AND g.source = COALESCE((
-                      SELECT mode FROM gold_rate_settings WHERE tenant_id = %s
-                  ), 'manual')
-                ORDER BY g.updated_at DESC LIMIT 1
-            """, (tenant_id, tenant_id))
-
-        row = cursor.fetchone()
-
-        if not row and branch_id and branch_id != "ALL":
-            # Fallback: no branch-specific rate — try any rate for this tenant
-            cursor.execute("""
-                SELECT g.rate_per_gram, g.updated_at,
-                       COALESCE(s.mode, 'manual') AS mode
-                FROM gold_rate g
-                LEFT JOIN gold_rate_settings s ON s.tenant_id = g.tenant_id
-                WHERE g.tenant_id = %s
-                ORDER BY g.updated_at DESC LIMIT 1
-            """, (tenant_id,))
-            row = cursor.fetchone()
-
-        if not row:
-            # Determine mode for fallback
-            cursor.execute("SELECT mode FROM gold_rate_settings WHERE tenant_id = %s", (tenant_id,))
-            mode_row = cursor.fetchone()
-            mode = mode_row["mode"] if mode_row else "manual"
+        if result["rate_per_gram"] == 0.0 and result["updated_at"] is None:
+            # No rate in DB yet — seed a default
+            mode = result["mode"]
             default_rate = fetch_default_market_rate(tenant_id) if mode == "auto" else 6500.0
             ts = insert_gold_rate(cursor, tenant_id, None, default_rate, mode)
             conn.commit()
-            return {"rate_per_gram": default_rate, "updated_at": ts, "mode": mode}
+            result = {"rate_per_gram": default_rate, "updated_at": ts, "mode": mode}
 
-        result = {
-            "rate_per_gram": row["rate_per_gram"],
-            "updated_at": row["updated_at"],
-            "mode": row["mode"]
-        }
-
-    _cache_set(cache_key, result)
+    _cache_set(cache_key, result, ttl=60)
     return result
         
 @api_router.post("/admin/gold-rate-mode")
@@ -9227,13 +9224,8 @@ async def get_gold_rate_summary(token_data: dict = Depends(require_role(['audito
     tenant_id = token_data["tenant_id"]
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT rate_per_gram FROM gold_rate
-            WHERE tenant_id = %s
-            ORDER BY updated_at DESC LIMIT 1
-        """, (tenant_id,))
-        row = cursor.fetchone()
-        current_rate = row["rate_per_gram"] if row else 0.0
+        result = resolve_gold_rate(cursor, tenant_id)
+        current_rate = result["rate_per_gram"]
 
         cursor.execute("""
             SELECT COUNT(*) AS cnt FROM gold_rate
@@ -9249,6 +9241,7 @@ async def get_gold_rate_summary(token_data: dict = Depends(require_role(['audito
 
         return {
             "current_rate": current_rate,
+            "mode": result["mode"],
             "auto_updates_today": auto_updates_today,
             "manual_updates_today": manual_updates_today,
         }
@@ -9991,73 +9984,12 @@ async def get_public_gold_rate(token_data: dict = Depends(verify_token)):
         tenant_id = token_data["tenant_id"]
         user_branch_id = token_data.get("branch_id")
 
-        # Single optimized query: resolve mode and fetch rate in one round-trip.
-        # Tries branch-specific rate first, falls back to global (branch_id IS NULL).
-        settings_mode = "manual"
-        cursor.execute(
-            "SELECT mode FROM gold_rate_settings WHERE tenant_id = %s",
-            (tenant_id,)
-        )
-        settings_row = cursor.fetchone()
-        if settings_row:
-            settings_mode = settings_row["mode"]
-
-        if user_branch_id:
-            cursor.execute("""
-                SELECT rate_per_gram, updated_at, source
-                FROM gold_rate
-                WHERE tenant_id = %s AND branch_id = %s AND source = %s
-                ORDER BY updated_at DESC LIMIT 1
-            """, (tenant_id, user_branch_id, settings_mode))
-            row = cursor.fetchone()
-
-            if not row:
-                # Fallback: global rate matching current mode
-                cursor.execute("""
-                    SELECT rate_per_gram, updated_at, source
-                    FROM gold_rate
-                    WHERE tenant_id = %s AND branch_id IS NULL AND source = %s
-                    ORDER BY updated_at DESC LIMIT 1
-                """, (tenant_id, settings_mode))
-                row = cursor.fetchone()
-
-            if not row:
-                # Last resort: any rate for this branch
-                cursor.execute("""
-                    SELECT rate_per_gram, updated_at, source
-                    FROM gold_rate
-                    WHERE tenant_id = %s AND branch_id = %s
-                    ORDER BY updated_at DESC LIMIT 1
-                """, (tenant_id, user_branch_id))
-                row = cursor.fetchone()
-        else:
-            cursor.execute("""
-                SELECT rate_per_gram, updated_at, source
-                FROM gold_rate
-                WHERE tenant_id = %s AND branch_id IS NULL AND source = %s
-                ORDER BY updated_at DESC LIMIT 1
-            """, (tenant_id, settings_mode))
-            row = cursor.fetchone()
-
-            if not row:
-                # Fallback: any global rate
-                cursor.execute("""
-                    SELECT rate_per_gram, updated_at, source
-                    FROM gold_rate
-                    WHERE tenant_id = %s AND branch_id IS NULL
-                    ORDER BY updated_at DESC LIMIT 1
-                """, (tenant_id,))
-                row = cursor.fetchone()
-
-        if not row:
-            return {"rate_per_gram": 0, "mode": settings_mode, "source": settings_mode}
-
-        return {
-            "rate_per_gram": row["rate_per_gram"],
-            "updated_at": row["updated_at"],
-            "source": row["source"],
-            "mode": settings_mode
-        }
+        result = resolve_gold_rate(cursor, tenant_id, user_branch_id)
+        console_mode = result["mode"]
+        console_rate = result["rate_per_gram"]
+        print(f"MODE: {console_mode}", flush=True)
+        print(f"RATE: {console_rate}", flush=True)
+        return result
 
 
 
