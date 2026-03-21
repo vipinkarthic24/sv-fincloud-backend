@@ -10084,23 +10084,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Bare health check — must be registered before the catch-all ──────────────
+# Railway healthcheck hits this before the DB is necessarily ready.
+@app.get("/api/health", include_in_schema=False)
+async def _health():
+    return {"status": "ok"}
+
 # ── Serve React frontend ──────────────────────────────────────────────────────
 # In the Docker container, frontend/build is copied into /app/frontend/build
-# ROOT_DIR is /app (backend source root), so we check both locations
 _FRONTEND_BUILD = ROOT_DIR / "frontend" / "build"
 if not _FRONTEND_BUILD.is_dir():
     _FRONTEND_BUILD = ROOT_DIR.parent / "frontend" / "build"
 
 if _FRONTEND_BUILD.is_dir():
-    # Serve static assets (JS, CSS, images, etc.)
-    app.mount("/static", StaticFiles(directory=str(_FRONTEND_BUILD / "static")), name="static")
-
-    @app.get("/{full_path:path}", include_in_schema=False)
-    async def serve_react(full_path: str):
-        """Catch-all: return index.html so React Router handles client-side routing."""
-        index = _FRONTEND_BUILD / "index.html"
-        return FileResponse(str(index))
+    # Only mount /static if the static sub-folder actually exists
+    _static_dir = _FRONTEND_BUILD / "static"
+    if _static_dir.is_dir():
+        app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
 
     @app.get("/", include_in_schema=False)
     async def serve_root():
         return FileResponse(str(_FRONTEND_BUILD / "index.html"))
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_react(full_path: str):
+        """Catch-all: return index.html so React Router handles client-side routing."""
+        return FileResponse(str(_FRONTEND_BUILD / "index.html"))
+
