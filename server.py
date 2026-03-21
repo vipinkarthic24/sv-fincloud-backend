@@ -2115,29 +2115,13 @@ async def apply_for_loan(
             if not request.gold_weight:
                 raise HTTPException(status_code=400, detail="Gold weight required")
 
-            # Get customer's branch_id
-            cursor.execute("""
-                SELECT branch_id FROM customers 
-                WHERE user_id = %s AND tenant_id = %s
-            """, (token_data["user_id"], token_data["tenant_id"]))
-            customer_row = cursor.fetchone()
-            customer_branch_id = customer_row["branch_id"] if customer_row else None
+            # Resolve gold rate using single source of truth (tenant-level, mode-based)
+            rate_result = resolve_gold_rate(cursor, token_data["tenant_id"])
+            gold_rate = rate_result["rate_per_gram"]
+            mode = rate_result["mode"]
 
-            # check mode for this tenant
-            cursor.execute("SELECT mode FROM gold_rate_settings WHERE tenant_id = %s", (token_data["tenant_id"],))
-            mode_row = cursor.fetchone()
-            mode = mode_row["mode"] if mode_row else "manual"
-
-            # Get branch-specific gold rate with fallback to global rate
-            gold_rate = get_gold_rate_for_branch(
-                str(DB_PATH),
-                token_data["tenant_id"],
-                customer_branch_id,
-                mode  # 'auto' or 'manual'
-            )
-            
             # Fallback to default if no rate found
-            if gold_rate is None:
+            if not gold_rate:
                 gold_rate = 6500.0
 
             max_loan = request.gold_weight * gold_rate * 0.75
@@ -7993,38 +7977,27 @@ def insert_gold_rate(cursor, tenant_id, branch_id, rate, source):
     return now_ts
 
 
-def resolve_gold_rate(cursor, tenant_id, branch_id=None):
+def resolve_gold_rate(cursor, tenant_id):
     """
     Single source of truth for gold rate resolution.
+    Rate depends ONLY on tenant_id + mode. Branch is irrelevant.
     1. Reads mode from gold_rate_settings (defaults to 'manual').
-    2. Fetches rate matching that mode — branch-specific first, then global fallback.
+    2. Fetches latest rate matching that mode for the tenant.
     Returns dict: { mode, rate_per_gram, updated_at }
     """
     cursor.execute("SELECT mode FROM gold_rate_settings WHERE tenant_id = %s", (tenant_id,))
     mode_row = cursor.fetchone()
     mode = mode_row["mode"] if mode_row else "manual"
 
-    row = None
-    if branch_id and branch_id != "ALL":
-        # Branch-specific rate matching mode
-        cursor.execute("""
-            SELECT rate_per_gram, updated_at FROM gold_rate
-            WHERE tenant_id = %s AND branch_id = %s AND source = %s
-            ORDER BY updated_at DESC LIMIT 1
-        """, (tenant_id, branch_id, mode))
-        row = cursor.fetchone()
+    cursor.execute("""
+        SELECT rate_per_gram, updated_at FROM gold_rate
+        WHERE tenant_id = %s AND source = %s
+        ORDER BY updated_at DESC LIMIT 1
+    """, (tenant_id, mode))
+    row = cursor.fetchone()
 
     if not row:
-        # Global rate matching mode
-        cursor.execute("""
-            SELECT rate_per_gram, updated_at FROM gold_rate
-            WHERE tenant_id = %s AND (branch_id IS NULL OR branch_id = 'ALL') AND source = %s
-            ORDER BY updated_at DESC LIMIT 1
-        """, (tenant_id, mode))
-        row = cursor.fetchone()
-
-    if not row:
-        # Last resort: any rate for tenant
+        # Fallback: any rate for tenant regardless of source
         cursor.execute("""
             SELECT rate_per_gram, updated_at FROM gold_rate
             WHERE tenant_id = %s
@@ -8046,23 +8019,16 @@ async def get_gold_rate(
 ):
     tenant_id = token_data["tenant_id"]
 
-    # Branch validation
-    if token_data["role"] == "admin":
-        if branch_id and branch_id != token_data.get("branch_id"):
-            raise HTTPException(403, "Access denied to this branch")
-        branch_id = token_data.get("branch_id")
-
-    cache_key = f"gold_rate:{tenant_id}:{branch_id}"
+    cache_key = f"gold_rate:{tenant_id}"
     cached = _cache_get(cache_key)
     if cached:
         return cached
 
     with get_db() as conn:
         cursor = conn.cursor()
-        result = resolve_gold_rate(cursor, tenant_id, branch_id)
+        result = resolve_gold_rate(cursor, tenant_id)
 
         if result["rate_per_gram"] == 0.0 and result["updated_at"] is None:
-            # No rate in DB yet — seed a default
             mode = result["mode"]
             default_rate = fetch_default_market_rate(tenant_id) if mode == "auto" else 6500.0
             ts = insert_gold_rate(cursor, tenant_id, None, default_rate, mode)
@@ -9982,13 +9948,8 @@ async def get_public_gold_rate(token_data: dict = Depends(verify_token)):
     with get_db() as conn:
         cursor = conn.cursor()
         tenant_id = token_data["tenant_id"]
-        user_branch_id = token_data.get("branch_id")
-
-        result = resolve_gold_rate(cursor, tenant_id, user_branch_id)
-        console_mode = result["mode"]
-        console_rate = result["rate_per_gram"]
-        print(f"MODE: {console_mode}", flush=True)
-        print(f"RATE: {console_rate}", flush=True)
+        result = resolve_gold_rate(cursor, tenant_id)
+        logger.debug("MODE: %s RATE: %s", result["mode"], result["rate_per_gram"])
         return result
 
 
