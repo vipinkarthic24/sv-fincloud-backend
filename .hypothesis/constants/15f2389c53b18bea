@@ -1,0 +1,4 @@
+# file: C:\Users\vipin\Downloads\sv-fincloud-erp\backend\services\gold_rate_service.py
+# hypothesis_version: 6.151.9
+
+[0.1, 1.05, 10.0, 30.0, 31.1035, 'BEGIN TRANSACTION', 'COMMIT', 'COMPUTERNAME', 'INRXAU', 'ROLLBACK', 'SESSIONNAME', 'USERNAME', '__main__', 'auto', 'daily_gold_rate', 'gold_rate', 'gold_rate_settings', 'manual', 'not set', 'rates', 'sv_fincloud.db']

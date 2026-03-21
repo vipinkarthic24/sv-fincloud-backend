@@ -1,0 +1,4 @@
+# file: C:\Users\vipin\Downloads\sv-fincloud-erp\backend\services\scheduler_service.py
+# hypothesis_version: 6.151.9
+
+[3600, 6543, '+00:00', '1', 'Asia/Kolkata', 'COMPUTERNAME', 'DB_HOST', 'DB_NAME', 'DB_PASSWORD', 'DB_PORT', 'DB_USER', 'SESSIONNAME', 'Scheduler shut down', 'USERDOMAIN', 'USERNAME', 'Z', '__name__', 'coalesce', 'completed', 'console', 'cron', 'daily_repo_rate', 'environment_context', 'environment_flag_set', 'error', 'expected_jobs', 'failed', 'func_name', 'id', 'job_details', 'job_name', 'max_instances', 'misfire_grace_time', 'missing_jobs', 'name', 'next_run_time', 'postgres', 'registered_jobs', 'require', 'services', 'started_at', 'total_jobs', 'trigger', 'unexpected_jobs', 'valid']

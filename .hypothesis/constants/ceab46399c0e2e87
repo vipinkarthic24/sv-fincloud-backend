@@ -1,0 +1,4 @@
+# file: C:\Users\vipin\Downloads\sv-fincloud-erp\backend\services\lending_engine_service.py
+# hypothesis_version: 6.151.9
+
+[-0.5, 0.0, 0.001, 0.5, 1.0, 2.0, 2.5, 4.0, 6.0, 6.5, 650, 675, 700, 725, 750, 6543, 50000, 200000, 'DB_HOST', 'DB_NAME', 'DB_PASSWORD', 'DB_PORT', 'DB_USER', 'age_0_3', 'age_4_6', 'age_7_plus', 'base_spread', 'cibil_650_699', 'cibil_700_749', 'cibil_750_plus', 'cibil_score', 'dynamic', 'fetched_at', 'gold_loan', 'id', 'is_overridden', 'loan_amount', 'personal_loan', 'postgres', 'rate', 'repo_rate', 'require', 'risk_premium', 'source', 'standard', 'vehicle_age', 'vehicle_loan']
