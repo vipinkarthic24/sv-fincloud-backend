@@ -6,6 +6,13 @@ from dotenv import load_dotenv
 from dateutil.relativedelta import relativedelta
 from starlette.middleware.cors import CORSMiddleware
 import os
+import time
+# Force IST for all datetime.now() calls that don't specify a timezone
+os.environ['TZ'] = 'Asia/Kolkata'
+try:
+    time.tzset()  # Linux/Mac only — no-op on Windows, safe to call
+except AttributeError:
+    pass
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field

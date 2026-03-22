@@ -4,6 +4,9 @@ All PDF reports use these helpers to ensure a consistent, professional layout.
 """
 import io
 from datetime import datetime
+import pytz
+
+IST = pytz.timezone("Asia/Kolkata")
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -45,27 +48,38 @@ def fmt_currency(amount) -> str:
 
 
 def fmt_datetime(ts) -> str:
-    """16/03/2026 06:10 PM"""
+    """16/03/2026 06:10 PM  (always IST)"""
     if ts is None:
         return "-"
-    if hasattr(ts, "strftime"):
-        return ts.strftime("%d/%m/%Y %I:%M %p")
     try:
-        from dateutil import parser as dtparser
-        return dtparser.parse(str(ts)).strftime("%d/%m/%Y %I:%M %p")
+        if hasattr(ts, "strftime"):
+            dt = ts
+        else:
+            from dateutil import parser as dtparser
+            dt = dtparser.parse(str(ts))
+        # Convert to IST if timezone-aware, or assume UTC if naive
+        if dt.tzinfo is None:
+            dt = pytz.utc.localize(dt)
+        dt = dt.astimezone(IST)
+        return dt.strftime("%d/%m/%Y %I:%M %p")
     except Exception:
         return str(ts)[:16]
 
 
 def fmt_date(ts) -> str:
-    """16/03/2026"""
+    """16/03/2026  (always IST)"""
     if ts is None:
         return "-"
-    if hasattr(ts, "strftime"):
-        return ts.strftime("%d/%m/%Y")
     try:
-        from dateutil import parser as dtparser
-        return dtparser.parse(str(ts)).strftime("%d/%m/%Y")
+        if hasattr(ts, "strftime"):
+            dt = ts
+        else:
+            from dateutil import parser as dtparser
+            dt = dtparser.parse(str(ts))
+        if dt.tzinfo is None:
+            dt = pytz.utc.localize(dt)
+        dt = dt.astimezone(IST)
+        return dt.strftime("%d/%m/%Y")
     except Exception:
         return str(ts)[:10]
 
@@ -208,7 +222,7 @@ def make_footer_cb(company_name: str = ""):
         canvas.setFont(FONT_REGULAR, 8)
         canvas.setFillColor(COLOR_FOOTER)
         canvas.drawString(margin, 28,
-                          f"Generated: {datetime.now().strftime('%d/%m/%Y %I:%M %p')}")
+                          f"Generated: {datetime.now(IST).strftime('%d/%m/%Y %I:%M %p')} IST")
         canvas.drawRightString(width - margin, 28,
                                f"Page {canvas.getPageNumber()}")
         canvas.restoreState()
