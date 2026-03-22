@@ -236,7 +236,17 @@ def daily_gold_rate_job():
             last = cursor.fetchone()
             last_rate = last["rate_per_gram"] if last else None
             if last_rate and abs(last_rate - gold_rate) < 0.1:
-                logger.debug("Tenant %s rate unchanged — skipping", tenant_id)
+                # Price unchanged — just touch updated_at so the UI shows today's date
+                cursor.execute("""
+                    UPDATE gold_rate
+                    SET updated_at = %s
+                    WHERE id = (
+                        SELECT id FROM gold_rate
+                        WHERE tenant_id = %s AND source = 'auto'
+                        ORDER BY updated_at DESC LIMIT 1
+                    )
+                """, (current_time, tenant_id))
+                logger.info("Tenant %s rate unchanged (diff < 0.1) — updated timestamp to %s", tenant_id, current_time)
                 continue
             new_id = str(uuid.uuid4())
             cursor.execute("""
