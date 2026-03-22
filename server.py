@@ -639,12 +639,28 @@ def init_db():
         try:
             cursor.execute("SAVEPOINT sp_vehicle_idx")
             cursor.execute("DROP INDEX IF EXISTS unique_active_vehicle_loan")
+
+            # Fix duplicate empty/NULL vehicle_reg_no values before creating the unique index.
+            # Assign unique placeholder values so the partial index (which excludes NULL/'')
+            # won't encounter duplicates on existing rows.
+            cursor.execute("""
+                UPDATE loans
+                SET vehicle_reg_no = 'TEMP_VEHICLE_' || ROW_NUMBER() OVER (ORDER BY created_at)
+                WHERE (vehicle_reg_no IS NULL OR TRIM(vehicle_reg_no) = '')
+                  AND status IN ('pending', 'pre-approved', 'active', 'approved', 'disbursed')
+            """)
+
+            # Recreate index excluding NULL and empty vehicle_reg_no so non-vehicle loans
+            # (gold, personal) with blank reg numbers don't collide.
             cursor.execute("""
                 CREATE UNIQUE INDEX unique_active_vehicle_loan
-                ON loans (UPPER(REPLACE(COALESCE(vehicle_reg_no, ''), ' ', '')))
+                ON loans (UPPER(REPLACE(vehicle_reg_no, ' ', '')))
                 WHERE status IN ('pending', 'pre-approved', 'active', 'approved', 'disbursed')
+                  AND vehicle_reg_no IS NOT NULL
+                  AND vehicle_reg_no != ''
             """)
             cursor.execute("RELEASE SAVEPOINT sp_vehicle_idx")
+            logger.info("✓ unique_active_vehicle_loan index created")
         except Exception as e:
             cursor.execute("ROLLBACK TO SAVEPOINT sp_vehicle_idx")
             logger.warning("unique_active_vehicle_loan index skipped: %s", e)
